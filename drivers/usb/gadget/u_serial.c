@@ -26,6 +26,10 @@
 
 #include "u_serial.h"
 
+#ifdef CONFIG_CONSOLE_POLL
+/* for kgdb support, directly talks to msm72k_udc for now */
+# include <mach/msm_hsusb.h>
+#endif
 
 /*
  * This component encapsulates the TTY layer glue needed to provide basic
@@ -77,6 +81,7 @@
  */
 #define QUEUE_SIZE		16
 #define WRITE_BUF_SIZE		8192		/* TX only */
+#define CONSOLE_BUF_SIZE	1024
 
 /* circular buffer */
 struct gs_buf {
@@ -999,6 +1004,12 @@ static int gs_break_ctl(struct tty_struct *tty, int duration)
 	return status;
 }
 
+#ifdef CONFIG_CONSOLE_POLL
+static int gs_poll_init(struct tty_driver *driver, int line, char *options);
+static int gs_poll_get_char(struct tty_driver *driver, int line);
+static void gs_poll_put_char(struct tty_driver *driver, int line, char ch);
+#endif
+
 static const struct tty_operations gs_tty_ops = {
 	.open =			gs_open,
 	.close =		gs_close,
@@ -1009,6 +1020,11 @@ static const struct tty_operations gs_tty_ops = {
 	.chars_in_buffer =	gs_chars_in_buffer,
 	.unthrottle =		gs_unthrottle,
 	.break_ctl =		gs_break_ctl,
+#ifdef CONFIG_CONSOLE_POLL
+	.poll_init = gs_poll_init,
+	.poll_get_char = gs_poll_get_char,
+	.poll_put_char = gs_poll_put_char,
+#endif
 };
 
 /*-------------------------------------------------------------------------*/
@@ -1328,3 +1344,187 @@ void gserial_disconnect(struct gserial *gser)
 	gs_free_requests(gser->in, &port->write_pool);
 	spin_unlock_irqrestore(&port->port_lock, flags);
 }
+
+#ifdef CONFIG_CONSOLE_POLL
+
+static char console_buf[CONSOLE_BUF_SIZE]; /* >= max packet size 512 */
+static int console_buf_len = 0, console_buf_read = 0;
+
+/*
+ * This set of functions are used to read/write simple characters
+ * from the USB serial ports, so they can be used for the console.
+ */
+static int gs_poll_init(struct tty_driver *driver, int port_num, char *options) {
+	struct gs_port *port;
+	struct tty_struct *tty;
+
+	if (!(port_num >= 0 && port_num < N_PORTS))
+		return -EINVAL;
+
+	port = ports[port_num].port;
+	if (!port)
+		return -ENODEV;
+
+	tty = port->port_tty;
+	if (!tty) {
+		/* the kgdb put/get char functions don't need a tty */
+		pr_vdebug("%s: no tty, but it's ok\n", __func__);
+		return 0;
+	} else {
+		pr_vdebug("%s: tty opened for port_num %d\n", __func__, port_num);
+	}
+	return 0;
+}
+
+static int gs_poll_pop_buffer(void) {
+	if (console_buf_read >= console_buf_len) {
+		return -EAGAIN;
+	}
+	return console_buf[console_buf_read++];
+}
+
+/**
+ * gs_poll_read_complete
+ */
+static void gs_poll_read_complete(struct usb_ep *ep,
+		struct usb_request *req) {
+	switch (req->status) {
+	case 0:
+		/* get data */
+		console_buf_len = req->actual;
+		console_buf_read = 0;
+		memcpy(console_buf, req->buf, req->actual);
+		console_buf[req->actual] = '\0';
+		pr_vdebug("[%s] len = %d\n", console_buf, console_buf_len);
+		break;
+
+	default:
+		pr_err("%s: unexpected status error, status=%d\n",
+				__func__, req->status);
+		break;
+	}
+}
+
+/**
+ * Gets a character from the usb endpoint under the
+ * interrupt context
+ *
+ * Returns 0 or a negative error number
+ */
+static int __gs_poll_get_char(struct gs_port *port, char *ch) {
+	struct gserial *gs = port->port_usb;
+	struct usb_ep *ept = gs->out;
+	struct usb_request *usb_req;
+	int rv;
+
+	int read_ch = -EINVAL;
+
+	BUG_ON(!ept);
+
+	for (;;) {
+		read_ch = gs_poll_pop_buffer();
+		if (read_ch >= 0) {
+			break; /* got a character, done */
+		}
+
+		/**
+		 * There is nothing in buffer, start the USB endpoint to
+		 * receive something
+		 */
+
+		/* Replace complete function to intercept usb read */
+		usb_req = gs_alloc_req(ept, ept->maxpacket, GFP_ATOMIC);
+		if (!usb_req) {
+			pr_err("%s: OOM for read req\n", __func__);
+			return -ENOMEM;
+		}
+
+		/* Queue request */
+		usb_req->length = ept->maxpacket;
+		usb_req->complete = gs_poll_read_complete;
+		if ((rv = usb_ep_queue(ept, usb_req, GFP_ATOMIC))) {
+			pr_err("%s: usb_ep_queue err %d\n", __func__, rv);
+			return rv;
+		}
+
+		/* Read and free request */
+		pr_vdebug("%s: polling for read\n", __func__);
+		while ( usb_loop_poll_hw(ept, 1 /*rx*/) );
+		gs_free_req(ept, usb_req);
+	}
+
+	*ch = read_ch;
+	return 0;
+}
+
+/**
+ * gs_poll_write_complete
+ */
+static void gs_poll_write_complete(struct usb_ep *ep,
+		struct usb_request *req) {
+	/* nothing needs to be done here */
+}
+
+/**
+ * Outputs a character to the usb endpoint under the
+ * interrupt context
+ */
+static int __gs_poll_put_char(struct gs_port *port, char ch) {
+	struct gserial *gs = port->port_usb;
+	struct usb_ep *ept = gs->in;
+	struct usb_request *usb_req;
+	char send_ch = ch;
+	int rv;
+
+	BUG_ON(!ept);
+
+	usb_req = gs_alloc_req(ept, ept->maxpacket, GFP_ATOMIC);
+	if (!usb_req) {
+		pr_err("%s: OOM for read req\n", __func__);
+		return -ENOMEM;
+	}
+
+	usb_req->complete = gs_poll_write_complete;
+	memcpy(usb_req->buf, &send_ch, 1);
+	usb_req->length = 1;
+	if ((rv = usb_ep_queue(ept, usb_req, GFP_ATOMIC))) {
+		pr_err("%s: usb_ep_queue err %d\n", __func__, rv);
+		return rv;
+	}
+
+	/* Send and free request */
+	pr_vdebug("%s: polling for write\n", __func__);
+	while ( usb_loop_poll_hw(ept, 0 /*tx*/) );
+	gs_free_req(ept, usb_req);
+
+	return 0;
+}
+
+static int gs_poll_get_char(struct tty_driver *driver, int line) {
+	struct gs_port *port;
+	char char_to_read = 0;
+	int rc = 0;
+
+	if (!(line >= 0 && line < N_PORTS))
+		return -EINVAL;
+
+	if (!(port = ports[line].port))
+		return -ENODEV;
+
+	rc = __gs_poll_get_char(port, &char_to_read);
+
+	return !rc ? char_to_read : rc;
+}
+
+static void gs_poll_put_char(struct tty_driver *driver, int line, char ch) {
+	struct gs_port *port;
+
+	if (!(line >= 0 && line < N_PORTS))
+		return;
+
+	if (!(port = ports[line].port))
+		return;
+
+	__gs_poll_put_char(port, ch);
+}
+#endif /* CONFIG_CONSOLE_POLL */

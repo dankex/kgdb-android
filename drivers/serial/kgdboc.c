@@ -24,6 +24,7 @@ static struct kgdb_io		kgdboc_io_ops;
 static int configured		= -1;
 
 static char config[MAX_CONFIG_LEN];
+static int config_retry_time = 0;
 static struct kparam_string kps = {
 	.string			= config,
 	.maxlen			= MAX_CONFIG_LEN,
@@ -45,6 +46,28 @@ static int kgdboc_option_setup(char *opt)
 
 __setup("kgdboc=", kgdboc_option_setup);
 
+static int kgdbretry_option_setup(char *opt)
+{
+	if (strlen(opt) > MAX_CONFIG_LEN) {
+		printk(KERN_ERR "kgdbretry: config string too long\n");
+		return -ENOSPC;
+	}
+	config_retry_time = simple_strtoul(opt, NULL, 10);
+
+	return 0;
+}
+
+__setup("kgdbretry=", kgdbretry_option_setup);
+
+static int configure_kgdboc(void);
+static void ttycheck_func(struct work_struct *work)
+{
+	config_retry_time = 0;
+	configure_kgdboc();
+}
+
+static DECLARE_DELAYED_WORK(ttycheck_work, ttycheck_func);
+
 static int configure_kgdboc(void)
 {
 	struct tty_driver *p;
@@ -58,8 +81,15 @@ static int configure_kgdboc(void)
 	err = -ENODEV;
 
 	p = tty_find_polling_driver(config, &tty_line);
-	if (!p)
+	if (!p) {
+		printk("kgdb will retry in %d secs\n", config_retry_time);
+		if (config_retry_time > 0) {
+			INIT_DELAYED_WORK(&ttycheck_work, ttycheck_func);
+			schedule_delayed_work(&ttycheck_work, config_retry_time * HZ);
+			return -ENODEV;
+		}
 		goto noconfig;
+	}
 
 	kgdb_tty_driver = p;
 	kgdb_tty_line = tty_line;
@@ -166,5 +196,6 @@ module_init(init_kgdboc);
 module_exit(cleanup_kgdboc);
 module_param_call(kgdboc, param_set_kgdboc_var, param_get_string, &kps, 0644);
 MODULE_PARM_DESC(kgdboc, "<serial_device>[,baud]");
+MODULE_PARM_DESC(kgdbretry, "<delay in seconds> before retrying tty");
 MODULE_DESCRIPTION("KGDB Console TTY Driver");
 MODULE_LICENSE("GPL");

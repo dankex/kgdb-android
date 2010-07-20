@@ -794,6 +794,57 @@ static void handle_endpoint(struct usb_info *ui, unsigned bit)
 	spin_unlock_irqrestore(&ui->lock, flags);
 }
 
+#ifdef CONFIG_CONSOLE_POLL
+int usb_loop_poll_hw(struct usb_ep *_ept, int is_rx)
+{
+	struct msm_endpoint *act_ept, *ept = to_msm_endpoint(_ept);
+	struct usb_info *ui = ept->ui;
+	int done = 0;
+	u32 n;
+
+	/* Normally there is a read request in the endpoint, wait for new data */
+	for (;;) {
+		n = readl(USB_USBSTS);
+		writel(n, USB_USBSTS);
+		if (n & STS_UI) /* finished transaction */
+			break;
+	}
+
+	/* USB Transaction is complete */
+	if (n & STS_UI) {
+		n = readl(USB_ENDPTSETUPSTAT);
+		if (n & EPT_RX(0))
+			handle_setup(ui);
+
+		n = readl(USB_ENDPTCOMPLETE);
+		writel(n, USB_ENDPTCOMPLETE);
+
+		while (n) {
+			unsigned bit = __ffs(n);
+			act_ept = ui->ept + bit;
+			if (ept == act_ept) {
+				pr_debug("%s: recv'd right tx %d\n", __func__, bit);
+				done = 1;
+			}
+			else {
+				pr_debug("%s: recv'd extra tx from ept %d (exp %d)\n",
+						__func__, bit, ept->bit);
+			}
+			/* always call the handler for KGDB and other usb functions. 
+			 * this is to avoid hardware timeout, but can leave a bit 
+			 * kernel code running when kgdb is invoked to stopped the 
+			 * kernel. this works quite well with adb but might not 
+			 * support usb mass storage devices very well.
+			 */
+			handle_endpoint(ui, bit);
+			n = n & (~(1 << bit));
+		}
+	}
+
+	return done ? 0 : -EAGAIN;
+}
+#endif /* CONFIG_CONSOLE_POLL */
+
 #define FLUSH_WAIT_US	5
 #define FLUSH_TIMEOUT	(2 * (USEC_PER_SEC / FLUSH_WAIT_US))
 static void flush_endpoint_hw(struct usb_info *ui, unsigned bits)

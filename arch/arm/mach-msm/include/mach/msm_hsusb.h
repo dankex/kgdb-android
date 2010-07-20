@@ -35,4 +35,9 @@ struct msm_hsusb_platform_data {
 	int *phy_init_seq;
 };
 
+#if defined(CONFIG_USB_GADGET_MSM_72K) && defined(CONFIG_CONSOLE_POLL)
+struct usb_ep;
+int usb_loop_poll_hw(struct usb_ep *_ept, int is_rx);
+#endif /* CONFIG_USB_GADGET_MSM_72K && CONFIG_CONSOLE_POLL */
+
 #endif
